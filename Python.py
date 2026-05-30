@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
+r"""
 ╔══════════════════════════════════════════════════════════════════╗
 ║          SISTEMA DE VIGILANCIA INTELIGENTE v2.0                 ║
 ║   Reconocimiento: Caras · Vehículos · Placas                    ║
@@ -35,6 +35,7 @@ import re
 import math
 import signal
 import traceback
+import ipaddress
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
@@ -108,9 +109,20 @@ CONFIG = {
     ],
 
     # ── Servidor Web ──────────────────────────────────────────────
-    "web_host": "0.0.0.0",
+    # Máxima privacidad por defecto: solo abre el panel en esta PC.
+    # Para verlo desde otro dispositivo de tu Wi-Fi, cambia a la IP local de esta PC
+    # (ej. "192.168.101.27") y permite Python en el Firewall de Windows solo en red privada.
+    "web_host": "127.0.0.1",
     "web_port": 8443,
-    "web_ssl": True,              # HTTPS con certificado auto-firmado
+    "web_ssl": True,              # True = HTTPS local con certificado auto-firmado
+
+    # Privacidad: por defecto NO instala ni descarga nada de internet al arrancar.
+    # Instala dependencias/modelos manualmente una vez, y luego mantenlo en False.
+    "auto_instalar_dependencias": False,
+    "permitir_descargas_modelos": False,
+    "permitir_rtsp_fuera_lan": False,     # Bloquea URLs de cámaras que no sean IP privada/local
+    "ocultar_credenciales_logs": True,    # No imprime usuario/contraseña RTSP en consola/logs
+    "forzar_https": True,                 # Rechaza peticiones HTTP si SSL está activo
 
     # ── Almacenamiento ────────────────────────────────────────────
     "max_gb_total": 25,           # Máximo GB en disco externo
@@ -209,8 +221,12 @@ def verificar_e_instalar_dependencias():
 
     print("\n  [OK] Todas las dependencias listas\n")
 
-# Ejecutar auto-instalación ANTES de importar
-verificar_e_instalar_dependencias()
+# Ejecutar auto-instalación ANTES de importar solo si se permite en CONFIG.
+# Recomendado para privacidad: mantener False después de la primera instalación manual.
+if CONFIG.get("auto_instalar_dependencias", False):
+    verificar_e_instalar_dependencias()
+else:
+    print("\n[PRIVACIDAD] Auto-instalación desactivada. No se descargará nada con pip.\n")
 
 # ── Ahora importar todo ──────────────────────────────────────────
 import cv2
@@ -805,11 +821,26 @@ class MotorDeteccion:
         """Carga los modelos de IA disponibles."""
         print("  Cargando modelos de detección...")
 
-        # YOLO para vehículos y personas
+        # YOLO para vehículos y personas. Por privacidad, solo carga modelos locales.
         if YOLO_DISPONIBLE:
             try:
-                self.modelo_yolo = YOLO("yolov8n.pt")  # Nano = más rápido
-                print("  ✓ YOLOv8 cargado (personas + vehículos)")
+                modelo_dir = Path(__file__).parent / "modelos"
+                posibles = [
+                    modelo_dir / "yolov8n.pt",
+                    Path(__file__).parent / "yolov8n.pt",
+                    Path.cwd() / "yolov8n.pt",
+                ]
+                modelo_local = next((m for m in posibles if m.exists()), None)
+                if modelo_local is None and CONFIG.get("permitir_descargas_modelos", False):
+                    # Puede descargar desde internet si no existe localmente.
+                    self.modelo_yolo = YOLO("yolov8n.pt")
+                elif modelo_local is not None:
+                    self.modelo_yolo = YOLO(str(modelo_local))
+                else:
+                    self.modelo_yolo = None
+                    print("  ⚠ YOLO desactivado: falta modelos/yolov8n.pt local")
+                if self.modelo_yolo is not None:
+                    print("  ✓ YOLOv8 cargado (personas + vehículos)")
             except Exception as e:
                 self.log.warning(f"YOLO no disponible: {e}")
 
@@ -822,8 +853,8 @@ class MotorDeteccion:
             prototxt = modelo_dir / "deploy.prototxt"
             caffemodel = modelo_dir / "res10_300x300_ssd_iter_140000.caffemodel"
 
-            # Descargar si no existe
-            if not caffemodel.exists():
+            # Por privacidad, no descargar modelos automáticamente salvo que se permita en CONFIG.
+            if (not caffemodel.exists() or not prototxt.exists()) and CONFIG.get("permitir_descargas_modelos", False):
                 self._descargar_modelo_cara(str(prototxt), str(caffemodel))
 
             if caffemodel.exists() and prototxt.exists():
@@ -847,7 +878,7 @@ class MotorDeteccion:
         # OCR para placas
         if OCR_DISPONIBLE:
             try:
-                self.lector_ocr = easyocr.Reader(['es', 'en'], gpu=False, verbose=False)
+                self.lector_ocr = easyocr.Reader(['es', 'en'], gpu=False, verbose=False, download_enabled=bool(CONFIG.get('permitir_descargas_modelos', False)))
                 print("  ✓ OCR para placas cargado")
             except Exception as e:
                 self.log.warning(f"OCR no disponible: {e}")
@@ -1929,9 +1960,13 @@ class ServidorWeb:
 
     def __init__(self, gestores_camara: list, almacen: GestorAlmacenamiento):
         self.app = Flask(__name__)
-        self.app.secret_key = secrets.token_bytes(64)
+        # Clave secreta persistente: evita que las sesiones se rompan en cada reinicio.
+        self.app.secret_key = self._cargar_o_crear_secret_key()
+        cookie_secure = bool(CONFIG.get("web_ssl", False))
         self.app.config.update({
-            "SESSION_COOKIE_SECURE": True,
+            # En HTTP local debe ser False, si no el navegador no guarda la cookie
+            # y el login redirige al inicio. En HTTPS se activa automáticamente.
+            "SESSION_COOKIE_SECURE": cookie_secure,
             "SESSION_COOKIE_HTTPONLY": True,
             "SESSION_COOKIE_SAMESITE": "Strict",
             "SESSION_COOKIE_NAME": "vs_session",
@@ -1944,6 +1979,27 @@ class ServidorWeb:
         self.csrf_tokens: Dict[str, float] = {}  # token -> expira
         self.csrf_lock = threading.Lock()
         self._registrar_rutas()
+
+    def _cargar_o_crear_secret_key(self) -> bytes:
+        """Carga una clave secreta local o la crea una sola vez. No sale a internet."""
+        try:
+            secret_dir = self.almacen.carpetas["sistema"]
+            secret_dir.mkdir(parents=True, exist_ok=True)
+            secret_file = secret_dir / "flask_secret.key"
+            if secret_file.exists():
+                data = secret_file.read_bytes()
+                if len(data) >= 32:
+                    return data
+            data = secrets.token_bytes(64)
+            secret_file.write_bytes(data)
+            try:
+                os.chmod(str(secret_file), 0o600)
+            except Exception:
+                pass
+            return data
+        except Exception:
+            # Último recurso: funciona, pero las sesiones se cerrarán al reiniciar.
+            return secrets.token_bytes(64)
 
     def _generar_csrf(self) -> str:
         token = secrets.token_urlsafe(32)
@@ -1982,9 +2038,19 @@ class ServidorWeb:
         ]
         return ops[secrets.randbelow(len(ops))]
 
+    def _render_login(self, error: str = ""):
+        pregunta, respuesta = self._capcha_simple()
+        return render_template_string(
+            HTML_PANEL, logged_in=False, error=error,
+            csrf_token=self._generar_csrf(),
+            captcha_pregunta=pregunta,
+            captcha_resp=hashlib.sha256(str(respuesta).encode()).hexdigest(),
+            username="", rol="", camaras=CONFIG["camaras"]
+        )
+
     def _headers_seguridad(self, response):
         """Agrega headers de seguridad a todas las respuestas."""
-        response.headers.update({
+        headers = {
             "X-Content-Type-Options": "nosniff",
             "X-Frame-Options": "DENY",
             "X-XSS-Protection": "1; mode=block",
@@ -1993,15 +2059,20 @@ class ServidorWeb:
                 "script-src 'self' 'unsafe-inline'; "
                 "style-src 'self' 'unsafe-inline'; "
                 "img-src 'self' data:; "
-                "font-src 'self';"
+                "font-src 'self'; "
+                "connect-src 'self'; "
+                "base-uri 'self'; "
+                "form-action 'self';"
             ),
             "Referrer-Policy": "no-referrer",
             "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
-            "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
             "Cache-Control": "no-store, no-cache, must-revalidate",
             "Pragma": "no-cache",
-            "Server": "Vigilancia/2.0",  # Ocultar versión real
-        })
+            "Server": "",  # No revelar software
+        }
+        if CONFIG.get("web_ssl", False):
+            headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers.update(headers)
         return response
 
     def _registrar_rutas(self):
@@ -2013,6 +2084,11 @@ class ServidorWeb:
 
         @app.before_request
         def antes_req():
+            # Si SSL está activo, aceptar solo HTTPS. Evita enviar cookies por HTTP.
+            if CONFIG.get("web_ssl", False) and CONFIG.get("forzar_https", True) and not request.is_secure:
+                # Permite que Flask sirva internamente; en acceso directo con ssl_context request.is_secure=True.
+                return "HTTPS requerido. Usa https:// en la barra del navegador.", 403
+
             # Verificar IP bloqueada
             ip = self._get_ip()
             if request.path not in ["/login", "/favicon.ico"] and \
@@ -2044,24 +2120,12 @@ class ServidorWeb:
 
             # Rate limiting básico
             if db.es_ip_bloqueada(ip):
-                return render_template_string(
-                    HTML_PANEL, logged_in=False,
-                    error="IP bloqueada temporalmente. Intenta más tarde.",
-                    csrf_token=self._generar_csrf(),
-                    captcha_pregunta="", captcha_resp="",
-                    username="", rol="", camaras=CONFIG["camaras"]
-                )
+                return self._render_login("IP bloqueada temporalmente. Intenta más tarde.")
 
             # Validar CSRF
             csrf = request.form.get("csrf_token", "")
             if not self._validar_csrf(csrf):
-                return render_template_string(
-                    HTML_PANEL, logged_in=False,
-                    error="Token inválido. Recarga la página.",
-                    csrf_token=self._generar_csrf(),
-                    captcha_pregunta="", captcha_resp="",
-                    username="", rol="", camaras=CONFIG["camaras"]
-                )
+                return self._render_login("Token inválido. Recarga la página.")
 
             # Validar captcha
             captcha_input = request.form.get("captcha", "").strip()
@@ -2109,7 +2173,7 @@ class ServidorWeb:
             response = redirect("/")
             response.set_cookie(
                 "vs_token", token,
-                httponly=True, secure=True, samesite="Strict",
+                httponly=True, secure=bool(CONFIG.get("web_ssl", False)), samesite="Strict",
                 max_age=CONFIG["sesion_timeout_min"] * 60
             )
             return response
@@ -2307,7 +2371,8 @@ class ServidorWeb:
                     x509.SubjectAlternativeName([
                         x509.DNSName("localhost"),
                         x509.DNSName("vigilancia.local"),
-                        x509.IPAddress(socket.gethostbyname(socket.gethostname())),
+                        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                        x509.IPAddress(ipaddress.ip_address(self._obtener_ip_local())),
                     ]),
                     critical=False,
                 )
@@ -2335,18 +2400,19 @@ class ServidorWeb:
 
     def iniciar(self):
         """Inicia el servidor web."""
-        ssl_ctx = self._generar_ssl()
+        ssl_ctx = self._generar_ssl() if CONFIG.get("web_ssl", False) else None
 
         host = CONFIG["web_host"]
         port = CONFIG["web_port"]
+        mostrar_host = "127.0.0.1" if host in ("0.0.0.0", "127.0.0.1", "localhost") else host
+        esquema = "https" if ssl_ctx else "http"
 
         print(f"\n  {'═'*50}")
-        if ssl_ctx:
-            print(f"  Panel web: https://{self._obtener_ip_local()}:{port}")
+        print(f"  Panel web: {esquema}://{mostrar_host}:{port}")
+        if host == "127.0.0.1":
+            print("  Modo privado: solo accesible desde esta PC")
         else:
-            port = 8080
-            print(f"  Panel web: http://{self._obtener_ip_local()}:{port}")
-        print(f"  (Accede desde cualquier dispositivo en tu red local)")
+            print("  Accesible en la red local si el Firewall de Windows lo permite")
         print(f"  {'═'*50}\n")
 
         # Desactivar logs de Flask en producción
@@ -2357,7 +2423,8 @@ class ServidorWeb:
         if ssl_ctx:
             context = ssl_mod.SSLContext(ssl_mod.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(ssl_ctx[0], ssl_ctx[1])
-            context.minimum_version = ssl_mod.TLSVersion.TLSv1_2
+            context.minimum_version = getattr(ssl_mod.TLSVersion, "TLSv1_3", ssl_mod.TLSVersion.TLSv1_2)
+            context.options |= ssl_mod.OP_NO_COMPRESSION
             self.app.run(
                 host=host, port=port,
                 ssl_context=context,
@@ -2372,14 +2439,16 @@ class ServidorWeb:
             )
 
     def _obtener_ip_local(self) -> str:
+        """Obtiene una IP local sin conectar a internet."""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
+            host = socket.gethostname()
+            for info in socket.getaddrinfo(host, None, socket.AF_INET):
+                ip = info[4][0]
+                if ip.startswith(("192.168.", "10.")) or re.match(r"^172\.(1[6-9]|2[0-9]|3[0-1])\.", ip):
+                    return ip
         except Exception:
-            return "localhost"
+            pass
+        return "127.0.0.1"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2456,6 +2525,63 @@ def configurar_logging(almacen: GestorAlmacenamiento):
     return root_log
 
 
+
+
+def _es_ip_privada_o_local(ip_txt: str) -> bool:
+    """True solo para IP privada, loopback o link-local. No consulta internet."""
+    try:
+        ip = ipaddress.ip_address(ip_txt.strip())
+        return bool(ip.is_private or ip.is_loopback or ip.is_link_local)
+    except Exception:
+        return False
+
+
+def validar_configuracion_privacidad() -> None:
+    """Endurece configuración antes de arrancar. Falla cerrado ante cámaras externas."""
+    from urllib.parse import urlparse
+
+    if CONFIG.get("web_host") == "0.0.0.0":
+        print("  ⚠ Seguridad: web_host=0.0.0.0 expone el panel en todas las interfaces.")
+        print("    Cambiando automáticamente a 127.0.0.1 para máxima privacidad.")
+        CONFIG["web_host"] = "127.0.0.1"
+
+    if CONFIG.get("forzar_https", True):
+        CONFIG["web_ssl"] = True
+        if int(CONFIG.get("web_port", 8443)) == 8080:
+            CONFIG["web_port"] = 8443
+
+    if not CONFIG.get("permitir_rtsp_fuera_lan", False):
+        for cam in CONFIG.get("camaras", []):
+            if not cam.get("activa", True):
+                continue
+            url = cam.get("url", "")
+            host = urlparse(url).hostname
+            if not host:
+                raise SystemExit(f"ERROR privacidad: cámara {cam.get('nombre')} no tiene host RTSP válido.")
+            # Por privacidad no resolvemos DNS aquí; exige IP privada/local explícita.
+            if not _es_ip_privada_o_local(host):
+                raise SystemExit(
+                    "ERROR privacidad: la cámara '%s' usa un host que no es IP privada/local: %s\n"
+                    "Usa una IP LAN tipo 192.168.x.x / 10.x.x.x / 172.16-31.x.x, "
+                    "o cambia permitir_rtsp_fuera_lan=True bajo tu responsabilidad."
+                    % (cam.get("nombre"), host)
+                )
+
+
+def ocultar_url_rtsp(url: str) -> str:
+    """Oculta usuario/contraseña al imprimir URLs RTSP."""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        u = urlsplit(url)
+        if "@" not in u.netloc:
+            return url
+        host = u.hostname or ""
+        if u.port:
+            host = f"{host}:{u.port}"
+        return urlunsplit((u.scheme, f"***:***@{host}", u.path, u.query, u.fragment))
+    except Exception:
+        return "rtsp://***:***@***"
+
 # ══════════════════════════════════════════════════════════════════
 # PUNTO DE ENTRADA PRINCIPAL
 # ══════════════════════════════════════════════════════════════════
@@ -2465,6 +2591,8 @@ def main():
     print("  SISTEMA DE VIGILANCIA INTELIGENTE v2.0")
     print("  Iniciando todos los subsistemas...")
     print("═" * 60 + "\n")
+
+    validar_configuracion_privacidad()
 
     # ── 1. Almacenamiento ──────────────────────────────────────────
     almacen = GestorAlmacenamiento()
@@ -2496,7 +2624,7 @@ def main():
         g = GestorCamara(cam_config, motor, almacen)
         if cam_config.get("activa", True):
             print(f"  → Cámara {cam_config['id']}: {cam_config['nombre']}")
-            print(f"    URL: {cam_config['url']}")
+            print(f"    URL: {ocultar_url_rtsp(cam_config['url']) if CONFIG.get('ocultar_credenciales_logs', True) else cam_config['url']}")
             print(f"    Guardar: "
                   f"{'👤 Personas ' if cam_config['guardar_personas'] else ''}"
                   f"{'🚗 Vehículos ' if cam_config['guardar_vehiculos'] else ''}"
