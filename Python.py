@@ -233,7 +233,7 @@ import cv2
 import numpy as np
 from PIL import Image
 import flask
-from flask import Flask, request, jsonify, session, send_file, redirect, url_for, render_template_string
+from flask import Flask, request, jsonify, session, send_file, redirect, url_for, render_template_string, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
 
 try:
@@ -1968,7 +1968,7 @@ class ServidorWeb:
             # y el login redirige al inicio. En HTTPS se activa automáticamente.
             "SESSION_COOKIE_SECURE": cookie_secure,
             "SESSION_COOKIE_HTTPONLY": True,
-            "SESSION_COOKIE_SAMESITE": "Strict",
+            "SESSION_COOKIE_SAMESITE": "Lax",
             "SESSION_COOKIE_NAME": "vs_session",
             "PERMANENT_SESSION_LIFETIME": timedelta(minutes=CONFIG["sesion_timeout_min"]),
             "MAX_CONTENT_LENGTH": 1 * 1024 * 1024,  # 1MB máximo
@@ -2023,9 +2023,32 @@ class ServidorWeb:
         return request.remote_addr or "0.0.0.0"
 
     def _verificar_sesion(self):
-        """Decorador: verifica que la sesión sea válida."""
+        """Verifica sesión válida.
+
+        Usa dos mecanismos compatibles:
+        1) sesión firmada de Flask, para que el panel no rebote al login;
+        2) token persistente en SQLite, para poder invalidar sesiones desde servidor.
+        """
         token = request.cookies.get("vs_token")
-        return BaseDatos.instancia().verificar_sesion(token)
+        sesion_db = BaseDatos.instancia().verificar_sesion(token) if token else None
+        if sesion_db:
+            # Mantener también la sesión firmada sincronizada.
+            session.permanent = True
+            session["auth"] = True
+            session["user_id"] = sesion_db.get("usuario_id")
+            session["username"] = sesion_db.get("username", "")
+            session["rol"] = sesion_db.get("rol", "viewer")
+            return sesion_db
+
+        # Fallback seguro: cookie firmada de Flask. Evita el bucle de redirección
+        # si el navegador pierde la cookie personalizada pero conserva vs_session.
+        if session.get("auth") and session.get("user_id"):
+            return {
+                "usuario_id": session.get("user_id"),
+                "username": session.get("username", ""),
+                "rol": session.get("rol", "viewer"),
+            }
+        return None
 
     def _capcha_simple(self) -> Tuple[str, int]:
         """Genera un captcha matemático simple."""
@@ -2170,10 +2193,33 @@ class ServidorWeb:
                 request.headers.get("User-Agent", "")[:200]
             )
 
-            response = redirect("/")
+            # Guardar sesión firmada de Flask + token de servidor.
+            # Renderizamos el panel directamente en vez de redirigir, para evitar
+            # el bucle de login cuando el navegador tarda en persistir cookies.
+            session.clear()
+            session.permanent = True
+            session["auth"] = True
+            session["user_id"] = usuario["id"]
+            session["username"] = usuario["username"]
+            session["rol"] = usuario.get("rol", "viewer")
+
+            response = make_response(render_template_string(
+                HTML_PANEL,
+                logged_in=True,
+                username=usuario["username"],
+                rol=usuario.get("rol", "viewer"),
+                csrf_token=self._generar_csrf(),
+                captcha_pregunta="",
+                captcha_resp="",
+                camaras=CONFIG["camaras"],
+                error="",
+            ))
             response.set_cookie(
                 "vs_token", token,
-                httponly=True, secure=bool(CONFIG.get("web_ssl", False)), samesite="Strict",
+                httponly=True,
+                secure=bool(CONFIG.get("web_ssl", False)),
+                samesite="Lax",
+                path="/",
                 max_age=CONFIG["sesion_timeout_min"] * 60
             )
             return response
@@ -2183,8 +2229,9 @@ class ServidorWeb:
             token = request.cookies.get("vs_token")
             if token:
                 BaseDatos.instancia().cerrar_sesion(token)
+            session.clear()
             response = redirect("/")
-            response.delete_cookie("vs_token")
+            response.delete_cookie("vs_token", path="/")
             return response
 
         # ── API Endpoints ──────────────────────────────────────────
