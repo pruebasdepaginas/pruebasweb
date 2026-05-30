@@ -36,7 +36,7 @@ import math
 import signal
 import traceback
 import ipaddress
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 from functools import wraps
@@ -2022,6 +2022,32 @@ class ServidorWeb:
             return request.headers["X-Forwarded-For"].split(",")[0].strip()
         return request.remote_addr or "0.0.0.0"
 
+    def _verificar_basic_auth(self):
+        """Autenticación HTTP Basic sobre HTTPS.
+
+        No depende de cookies ni redirecciones. Esto evita el fallo donde el
+        navegador no guardaba la sesión y regresaba siempre al login.
+        """
+        auth = request.authorization
+        if not auth or not auth.username or not auth.password:
+            return None
+        usuario = BaseDatos.instancia().verificar_usuario(
+            auth.username.strip()[:50],
+            auth.password[:128]
+        )
+        if not usuario:
+            return None
+        return {
+            "usuario_id": usuario["id"],
+            "username": usuario["username"],
+            "rol": usuario.get("rol", "viewer"),
+        }
+
+    def _respuesta_basic_auth(self, mensaje: str = "Autenticacion requerida"):
+        response = make_response(mensaje, 401)
+        response.headers["WWW-Authenticate"] = 'Basic realm="Vigilancia Local", charset="UTF-8"'
+        return response
+
     def _verificar_sesion(self):
         """Verifica sesión válida.
 
@@ -2107,141 +2133,59 @@ class ServidorWeb:
 
         @app.before_request
         def antes_req():
-            # Si SSL está activo, aceptar solo HTTPS. Evita enviar cookies por HTTP.
+            # Si SSL está activo, aceptar solo HTTPS. Evita credenciales por HTTP.
             if CONFIG.get("web_ssl", False) and CONFIG.get("forzar_https", True) and not request.is_secure:
-                # Permite que Flask sirva internamente; en acceso directo con ssl_context request.is_secure=True.
                 return "HTTPS requerido. Usa https:// en la barra del navegador.", 403
 
-            # Verificar IP bloqueada
+            if request.path == "/favicon.ico":
+                return None
+
             ip = self._get_ip()
-            if request.path not in ["/login", "/favicon.ico"] and \
-               BaseDatos.instancia().es_ip_bloqueada(ip):
+            if BaseDatos.instancia().es_ip_bloqueada(ip):
                 return "Acceso denegado temporalmente.", 403
+
+            # Protección principal: HTTP Basic sobre HTTPS.
+            # Sin cookies, sin sesiones del navegador y sin bucles de redirección.
+            if not self._verificar_basic_auth():
+                return self._respuesta_basic_auth()
 
         @app.route("/")
         def index():
-            sesion = self._verificar_sesion()
-            csrf = self._generar_csrf()
-            pregunta, respuesta = self._capcha_simple()
-            resp_hash = hashlib.sha256(str(respuesta).encode()).hexdigest()
+            usuario = self._verificar_basic_auth()
+            if not usuario:
+                return self._respuesta_basic_auth()
             return render_template_string(
                 HTML_PANEL,
-                logged_in=bool(sesion),
-                username=sesion.get("username", "") if sesion else "",
-                rol=sesion.get("rol", "viewer") if sesion else "",
-                csrf_token=csrf,
-                captcha_pregunta=pregunta,
-                captcha_resp=resp_hash,
-                camaras=CONFIG["camaras"],
-                error="",
-            )
-
-        @app.route("/login", methods=["POST"])
-        def login():
-            ip = self._get_ip()
-            db = BaseDatos.instancia()
-
-            # Rate limiting básico
-            if db.es_ip_bloqueada(ip):
-                return self._render_login("IP bloqueada temporalmente. Intenta más tarde.")
-
-            # Validar CSRF
-            csrf = request.form.get("csrf_token", "")
-            if not self._validar_csrf(csrf):
-                return self._render_login("Token inválido. Recarga la página.")
-
-            # Validar captcha
-            captcha_input = request.form.get("captcha", "").strip()
-            captcha_resp = request.form.get("captcha_resp", "")
-            captcha_hash = hashlib.sha256(captcha_input.encode()).hexdigest()
-            if not hmac.compare_digest(captcha_hash, captcha_resp):
-                db.registrar_intento_login(ip, False)
-                pregunta, respuesta = self._capcha_simple()
-                return render_template_string(
-                    HTML_PANEL, logged_in=False,
-                    error="Verificación incorrecta.",
-                    csrf_token=self._generar_csrf(),
-                    captcha_pregunta=pregunta,
-                    captcha_resp=hashlib.sha256(str(respuesta).encode()).hexdigest(),
-                    username="", rol="", camaras=CONFIG["camaras"]
-                )
-
-            # Validar credenciales
-            username = request.form.get("username", "").strip()[:50]
-            password = request.form.get("password", "")[:128]
-
-            # Delay artificial anti-timing attack
-            time.sleep(secrets.randbelow(3) * 0.1 + 0.2)
-
-            usuario = db.verificar_usuario(username, password)
-            if not usuario:
-                db.registrar_intento_login(ip, False)
-                pregunta, respuesta = self._capcha_simple()
-                return render_template_string(
-                    HTML_PANEL, logged_in=False,
-                    error="Credenciales incorrectas.",
-                    csrf_token=self._generar_csrf(),
-                    captcha_pregunta=pregunta,
-                    captcha_resp=hashlib.sha256(str(respuesta).encode()).hexdigest(),
-                    username="", rol="", camaras=CONFIG["camaras"]
-                )
-
-            # Login exitoso
-            db.registrar_intento_login(ip, True)
-            token = db.crear_sesion(
-                usuario["id"], ip,
-                request.headers.get("User-Agent", "")[:200]
-            )
-
-            # Guardar sesión firmada de Flask + token de servidor.
-            # Renderizamos el panel directamente en vez de redirigir, para evitar
-            # el bucle de login cuando el navegador tarda en persistir cookies.
-            session.clear()
-            session.permanent = True
-            session["auth"] = True
-            session["user_id"] = usuario["id"]
-            session["username"] = usuario["username"]
-            session["rol"] = usuario.get("rol", "viewer")
-
-            response = make_response(render_template_string(
-                HTML_PANEL,
                 logged_in=True,
-                username=usuario["username"],
+                username=usuario.get("username", ""),
                 rol=usuario.get("rol", "viewer"),
-                csrf_token=self._generar_csrf(),
+                csrf_token="",
                 captcha_pregunta="",
                 captcha_resp="",
                 camaras=CONFIG["camaras"],
                 error="",
-            ))
-            response.set_cookie(
-                "vs_token", token,
-                httponly=True,
-                secure=bool(CONFIG.get("web_ssl", False)),
-                samesite="Lax",
-                path="/",
-                max_age=CONFIG["sesion_timeout_min"] * 60
             )
-            return response
+
+        @app.route("/login", methods=["GET", "POST"])
+        def login():
+            # Ya no usamos formulario/cookies. El navegador pedirá usuario y contraseña
+            # mediante HTTP Basic al abrir /.
+            return redirect("/")
 
         @app.route("/logout")
         def logout():
-            token = request.cookies.get("vs_token")
-            if token:
-                BaseDatos.instancia().cerrar_sesion(token)
-            session.clear()
-            response = redirect("/")
-            response.delete_cookie("vs_token", path="/")
-            return response
+            # HTTP Basic no tiene cierre de sesión perfecto desde servidor.
+            # Cierra la pestaña o abre en ventana privada para cambiar usuario.
+            return self._respuesta_basic_auth("Sesion cerrada. Cierra esta pestana para completar el cierre.")
 
         # ── API Endpoints ──────────────────────────────────────────
         def require_auth(f):
             @wraps(f)
             def decorated(*args, **kwargs):
-                sesion = self._verificar_sesion()
-                if not sesion:
+                usuario = self._verificar_basic_auth()
+                if not usuario:
                     return jsonify({"error": "No autorizado"}), 401
-                return f(sesion, *args, **kwargs)
+                return f(usuario, *args, **kwargs)
             return decorated
 
         def require_admin(f):
@@ -2382,95 +2326,140 @@ class ServidorWeb:
             return jsonify({"error": "Solicitud demasiado grande"}), 413
 
     def _generar_ssl(self) -> Optional[Tuple[str, str]]:
-        """Genera certificado SSL auto-firmado."""
+        """Genera o repara un certificado SSL local auto-firmado. No conecta a internet."""
         if not SSL_DISPONIBLE:
+            print("  ✗ No se puede usar HTTPS: falta la librería cryptography.")
+            print("    Instala: pip install cryptography")
             return None
 
-        ssl_dir = GestorAlmacenamiento().carpetas["ssl"]
+        ssl_dir = self.almacen.carpetas.get("ssl") or (Path(CONFIG["disco_externo"]) / CONFIG["carpeta_base"] / "sistema" / "ssl")
+        ssl_dir.mkdir(parents=True, exist_ok=True)
         cert_file = ssl_dir / "cert.pem"
         key_file = ssl_dir / "key.pem"
 
-        if cert_file.exists() and key_file.exists():
+        def certificado_valido() -> bool:
+            if not cert_file.exists() or not key_file.exists():
+                return False
+            try:
+                import ssl as _ssl
+                ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(str(cert_file), str(key_file))
+                return True
+            except Exception:
+                return False
+
+        if certificado_valido():
             return str(cert_file), str(key_file)
 
+        for p in (cert_file, key_file):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
         try:
-            print("  Generando certificado SSL auto-firmado...")
+            print("  Generando certificado SSL local auto-firmado...")
             key = rsa.generate_private_key(
-                public_exponent=65537, key_size=4096,
+                public_exponent=65537,
+                key_size=2048,
                 backend=default_backend()
             )
             subject = issuer = x509.Name([
                 x509.NameAttribute(NameOID.COUNTRY_NAME, "MX"),
                 x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Local"),
                 x509.NameAttribute(NameOID.LOCALITY_NAME, "Red Local"),
-                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Sistema Vigilancia"),
-                x509.NameAttribute(NameOID.COMMON_NAME, "vigilancia.local"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Sistema Vigilancia Local"),
+                x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
             ])
+
+            san_items = [x509.DNSName("localhost"), x509.DNSName("vigilancia.local")]
+            posibles_ips = {"127.0.0.1", "::1"}
+
+            host_cfg = str(CONFIG.get("web_host", "127.0.0.1")).strip()
+            if host_cfg and host_cfg not in ("0.0.0.0", "localhost"):
+                posibles_ips.add(host_cfg)
+            try:
+                ip_lan = self._obtener_ip_local()
+                if ip_lan:
+                    posibles_ips.add(ip_lan)
+            except Exception:
+                pass
+
+            for ip_txt in sorted(posibles_ips):
+                try:
+                    san_items.append(x509.IPAddress(ipaddress.ip_address(ip_txt)))
+                except Exception:
+                    if re.match(r"^[A-Za-z0-9.-]+$", ip_txt):
+                        san_items.append(x509.DNSName(ip_txt))
+
+            now = datetime.now(timezone.utc)
             cert = (
                 x509.CertificateBuilder()
                 .subject_name(subject)
                 .issuer_name(issuer)
                 .public_key(key.public_key())
                 .serial_number(x509.random_serial_number())
-                .not_valid_before(datetime.utcnow())
-                .not_valid_after(datetime.utcnow() + timedelta(days=3650))
-                .add_extension(
-                    x509.SubjectAlternativeName([
-                        x509.DNSName("localhost"),
-                        x509.DNSName("vigilancia.local"),
-                        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
-                        x509.IPAddress(ipaddress.ip_address(self._obtener_ip_local())),
-                    ]),
-                    critical=False,
-                )
+                .not_valid_before(now - timedelta(minutes=5))
+                .not_valid_after(now + timedelta(days=3650))
+                .add_extension(x509.SubjectAlternativeName(san_items), critical=False)
+                .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
                 .sign(key, hashes.SHA256(), default_backend())
             )
-
-            with open(key_file, "wb") as f:
-                f.write(key.private_bytes(
-                    serialization.Encoding.PEM,
-                    serialization.PrivateFormat.TraditionalOpenSSL,
-                    serialization.NoEncryption()
-                ))
-            with open(cert_file, "wb") as f:
-                f.write(cert.public_bytes(serialization.Encoding.PEM))
-
-            # Proteger archivos
-            os.chmod(str(key_file), 0o600)
-            os.chmod(str(cert_file), 0o644)
-
-            print(f"  ✓ Certificado SSL generado")
+            key_file.write_bytes(key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption()
+            ))
+            cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+            try:
+                os.chmod(str(key_file), 0o600)
+                os.chmod(str(cert_file), 0o644)
+            except Exception:
+                pass
+            if not certificado_valido():
+                raise RuntimeError("El certificado se generó, pero Python no pudo cargarlo")
+            print("  ✓ Certificado SSL generado/reparado")
             return str(cert_file), str(key_file)
         except Exception as e:
-            print(f"  ⚠ No se pudo generar SSL: {e}")
+            print(f"  ✗ No se pudo generar SSL: {e}")
             return None
 
     def iniciar(self):
         """Inicia el servidor web."""
         ssl_ctx = self._generar_ssl() if CONFIG.get("web_ssl", False) else None
 
+        # Falla cerrado: si HTTPS está activado y el certificado falla, no abrir HTTP por accidente.
+        if CONFIG.get("web_ssl", False) and not ssl_ctx:
+            print("\n  ✗ HTTPS está activado, pero no se pudo crear/cargar el certificado.")
+            print("    Por seguridad NO se abrirá el panel en HTTP.")
+            print("    Instala/repara cryptography: pip install --upgrade cryptography")
+            return
+
         host = CONFIG["web_host"]
-        port = CONFIG["web_port"]
+        port = int(CONFIG["web_port"])
         mostrar_host = "127.0.0.1" if host in ("0.0.0.0", "127.0.0.1", "localhost") else host
         esquema = "https" if ssl_ctx else "http"
 
-        print(f"\n  {'═'*50}")
-        print(f"  Panel web: {esquema}://{mostrar_host}:{port}")
+        print(f"\n  {'═'*58}")
+        print(f"  Panel web seguro: {esquema}://{mostrar_host}:{port}")
+        if ssl_ctx:
+            print("  IMPORTANTE: usa HTTPS y el puerto 8443.")
+            print(f"  Correcto:   https://{mostrar_host}:{port}")
+            print("  Incorrecto: https://...:8080  o  http://...:8443")
         if host == "127.0.0.1":
             print("  Modo privado: solo accesible desde esta PC")
         else:
-            print("  Accesible en la red local si el Firewall de Windows lo permite")
-        print(f"  {'═'*50}\n")
+            print("  Accesible en red local solo si el Firewall de Windows lo permite")
+        print(f"  {'═'*58}\n")
 
-        # Desactivar logs de Flask en producción
-        log_flask = logging.getLogger("werkzeug")
-        log_flask.setLevel(logging.ERROR)
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-        import ssl as ssl_mod
         if ssl_ctx:
+            import ssl as ssl_mod
             context = ssl_mod.SSLContext(ssl_mod.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(ssl_ctx[0], ssl_ctx[1])
-            context.minimum_version = getattr(ssl_mod.TLSVersion, "TLSv1_3", ssl_mod.TLSVersion.TLSv1_2)
+            context.minimum_version = ssl_mod.TLSVersion.TLSv1_2
             context.options |= ssl_mod.OP_NO_COMPRESSION
             self.app.run(
                 host=host, port=port,
